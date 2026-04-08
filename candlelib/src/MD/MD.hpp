@@ -251,6 +251,82 @@ namespace mab
         /// @return Temperature in degrees celsius from 0 C to 125 C
         std::pair<u8, Error_t> getTemperature();
 
+        // ─────────────────────────────────────────────────────────────────────
+        // Ophanim phase 02.1 additions: bulk-state convenience wrappers.
+        // These collapse 4 single-register sync round-trips into ONE CAN
+        // transaction via the existing readRegisters / readRegistersAsync
+        // variadic templates. Upstream-friendly (no new includes, no new
+        // members, all delegation). Added per Phase 02.1 D-R2.
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// @brief Bulk-read main state (position, velocity, torque, temperature)
+        ///        in ONE CAN transaction. Result is stored in m_mdRegisters.
+        inline Error_t readMainState()
+        {
+            return readRegisters(m_mdRegisters.mainEncoderPosition,
+                                 m_mdRegisters.mainEncoderVelocity,
+                                 m_mdRegisters.motorTorque,
+                                 m_mdRegisters.motorTemperature);
+        }
+
+        /// @brief Bulk-read main state with out-params filled on Error_t::OK.
+        inline Error_t readMainState(float& position_out,
+                                     float& velocity_out,
+                                     float& torque_out,
+                                     uint8_t& temperature_out)
+        {
+            const auto err = readMainState();
+            if (err == Error_t::OK)
+            {
+                position_out    = m_mdRegisters.mainEncoderPosition.value;
+                velocity_out    = m_mdRegisters.mainEncoderVelocity.value;
+                torque_out      = m_mdRegisters.motorTorque.value;
+                temperature_out = m_mdRegisters.motorTemperature.value;
+            }
+            return err;
+        }
+
+        /// @brief Async bulk-read main state. Caller MUST .get() the future
+        ///        before issuing another async call on the same MD instance.
+        inline std::future<Error_t> readMainStateAsync()
+        {
+            return readRegistersAsync(m_mdRegisters.mainEncoderPosition,
+                                      m_mdRegisters.mainEncoderVelocity,
+                                      m_mdRegisters.motorTorque,
+                                      m_mdRegisters.motorTemperature);
+        }
+
+        /// @brief No-I/O accessor returning the cached values left in
+        ///        m_mdRegisters by the most recent sync/async main-state read.
+        ///        Added per Phase 02.1 revision BLOCKER 1 (option b):
+        ///        non-invasive alternative to making m_mdRegisters public.
+        ///        After readMainStateAsync().get() returns OK, callers MUST
+        ///        use this accessor to retrieve values (never re-call
+        ///        readMainState() which would issue another round-trip).
+        inline void getLastMainState(float& position_out,
+                                     float& velocity_out,
+                                     float& torque_out,
+                                     uint8_t& temperature_out) const
+        {
+            position_out    = m_mdRegisters.mainEncoderPosition.value;
+            velocity_out    = m_mdRegisters.mainEncoderVelocity.value;
+            torque_out      = m_mdRegisters.motorTorque.value;
+            temperature_out = m_mdRegisters.motorTemperature.value;
+        }
+
+        /// @brief Bulk-write targetPosition + targetTorque in ONE CAN
+        ///        transaction. For leg motors only. Added per Phase 02.1
+        ///        revision BLOCKER 1 so the io_loop rewrite (Plan 02.1-03)
+        ///        has a concrete public API and never reaches into
+        ///        m_mdRegisters from caller code.
+        inline Error_t writeMainTargets(float position, float torque)
+        {
+            m_mdRegisters.targetPosition.value = position;
+            m_mdRegisters.targetTorque.value   = torque;
+            return writeRegisters(m_mdRegisters.targetPosition,
+                                  m_mdRegisters.targetTorque);
+        }
+
         /// @brief Read register from the memory of the MD
         /// @tparam T Register entry underlying type (should be deducible)
         /// @param reg Register entry reference to be read from memory (reference is
