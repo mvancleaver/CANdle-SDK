@@ -34,6 +34,7 @@
 
 #ifndef WIN32
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -52,6 +53,14 @@ class SocketCAN final : public I_CommunicationInterface
     /// @brief Construct a SocketCAN backend bound to the named CAN-FD network interface.
     /// @param ifname Interface name (e.g. "can1" or "vcan0"). Default "can1" for X8.
     explicit SocketCAN(std::string_view ifname = "can1");
+
+    /// @brief Construct a SocketCAN backend bound to the named CAN-FD network interface
+    ///        with an optional per-socket CAN_RAW_FILTER (Phase 07.1.3 D-11 approach b2).
+    ///        When @p filter_id is set, connect() will apply CAN_RAW_FILTER to accept
+    ///        only frames matching that motor_id (mask=CAN_SFF_MASK).
+    /// @param ifname Interface name (e.g. "can1" or "vcan0").
+    /// @param filter_id Motor CAN ID (11-bit standard frame) to filter on; std::nullopt = no filter.
+    SocketCAN(std::string_view ifname, std::optional<canId_t> filter_id);
 
     ~SocketCAN() override;
 
@@ -88,6 +97,15 @@ class SocketCAN final : public I_CommunicationInterface
         const u32       timeoutMs,
         const size_t    expectedReceivedDataSize) override;
 
+    /// @brief Apply a per-socket CAN_RAW_FILTER for a single motor_id.
+    ///        Phase 07.1.3 D-11 (approach b2): per-motor SocketCAN sockets with
+    ///        kernel-level can_id isolation, avoiding response cross-talk between
+    ///        worker threads (RESEARCH §1.5 + Pitfall 2).
+    ///        Returns NOT_CONNECTED if called before connect().
+    ///        Returns INITIALIZATION_ERROR if setsockopt fails.
+    ///        See linux/can/raw.h CAN_RAW_FILTER + CAN_SFF_MASK.
+    Error_t set_can_id_filter(canId_t motor_id);
+
   private:
     /// @brief Parse the USB-dongle envelope (cmd=4) and write canfd_frame to socket.
     ///        Returns OK on success, TRANSMITTER_ERROR on failure (with 1 ENOBUFS retry).
@@ -99,8 +117,9 @@ class SocketCAN final : public I_CommunicationInterface
     std::pair<std::vector<u8>, Error_t> recv_can_frame(
         u32 timeoutMs, size_t expectedSize);
 
-    std::string m_ifname;
-    int         m_sockfd{-1};
+    std::string             m_ifname;
+    int                     m_sockfd{-1};
+    std::optional<canId_t>  m_filter_id;  ///< Phase 07.1.3 D-11: optional per-socket motor_id filter applied in connect()
 
     Logger m_logger = Logger(Logger::ProgramLayer_E::BOTTOM, "SocketCAN");
 
@@ -134,6 +153,7 @@ class SocketCAN final : public I_CommunicationInterface
 
 #else  // WIN32
 
+#include <optional>
 #include <utility>
 #include <vector>
 #include "I_communication_interface.hpp"
@@ -147,6 +167,7 @@ class SocketCAN final : public I_CommunicationInterface
 {
   public:
     explicit SocketCAN(std::string_view /*ifname*/ = "can1") {}
+    SocketCAN(std::string_view /*ifname*/, std::optional<canId_t> /*filter_id*/) {}
     ~SocketCAN() override {}
 
     Error_t connect() override { return Error_t::INITIALIZATION_ERROR; }
@@ -162,6 +183,7 @@ class SocketCAN final : public I_CommunicationInterface
     {
         return {std::vector<u8>(), Error_t::INITIALIZATION_ERROR};
     }
+    Error_t set_can_id_filter(canId_t /*motor_id*/) { return Error_t::INITIALIZATION_ERROR; }
 
   private:
     Logger m_logger = Logger(Logger::ProgramLayer_E::BOTTOM, "SocketCAN");

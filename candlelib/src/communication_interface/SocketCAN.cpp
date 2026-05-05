@@ -62,6 +62,11 @@ SocketCAN::SocketCAN(std::string_view ifname) : m_ifname(ifname)
 {
 }
 
+SocketCAN::SocketCAN(std::string_view ifname, std::optional<canId_t> filter_id)
+    : m_ifname(ifname), m_filter_id(filter_id)
+{
+}
+
 SocketCAN::~SocketCAN()
 {
     disconnect();
@@ -146,8 +151,66 @@ I_CommunicationInterface::Error_t SocketCAN::connect()
     int loopback = 0;
     setsockopt(m_sockfd, SOL_CAN_RAW, CAN_RAW_LOOPBACK, &loopback, sizeof(loopback));
 
+    // Step 7: Phase 07.1.3 D-11 — apply optional per-socket motor_id filter.
+    // When the constructor was given filter_id (approach b2 per-motor sockets),
+    // call set_can_id_filter now (post-bind, post-RAW_FD_FRAMES). Failure here
+    // is fatal: close the socket and return error so the caller does not get
+    // a half-initialized fd that delivers cross-talk frames.
+    if (m_filter_id.has_value())
+    {
+        const Error_t fe = set_can_id_filter(*m_filter_id);
+        if (fe != Error_t::OK)
+        {
+            m_logger.error("SocketCAN: optional ctor filter setup failed for motor_id=0x%X — closing socket",
+                           static_cast<unsigned>(*m_filter_id));
+            close(m_sockfd);
+            m_sockfd = -1;
+            return fe;
+        }
+    }
+
     m_logger.info("SocketCAN: connected to '%s' (ifindex=%d, mtu=%d)",
                   m_ifname.c_str(), ifindex, ifr.ifr_mtu);
+    return Error_t::OK;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// set_can_id_filter() — Phase 07.1.3 D-11 approach b2 per-socket motor_id filter
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Applies a single-motor CAN_RAW_FILTER on the socket so the kernel only delivers
+// frames whose can_id matches @p motor_id (mask = CAN_SFF_MASK = 0x7FF, 11-bit
+// standard CAN). This prevents response cross-talk between worker threads in
+// AsyncIoPool (RESEARCH §1.5 + §7 Example 1; Pitfall 2).
+//
+// Linux kernel reference: linux/can/raw.h struct can_filter { canid_t can_id;
+// canid_t can_mask; }; setsockopt(SOL_CAN_RAW, CAN_RAW_FILTER, &filter, sizeof(filter)).
+//
+// MUST be called AFTER connect() succeeds (m_sockfd >= 0). Calling before connect()
+// returns NOT_CONNECTED.
+I_CommunicationInterface::Error_t SocketCAN::set_can_id_filter(canId_t motor_id)
+{
+    if (m_sockfd < 0)
+    {
+        m_logger.error("SocketCAN: set_can_id_filter called before connect");
+        return Error_t::NOT_CONNECTED;
+    }
+
+    // CANdle-SDK uses 11-bit IDs for motor IDs (CAN_SFF_MASK = 0x7FF).
+    // Filter: accept only frames with can_id matching motor_id (mask = SFF mask).
+    struct can_filter rfilter;
+    rfilter.can_id   = static_cast<canid_t>(motor_id);
+    rfilter.can_mask = CAN_SFF_MASK;
+    if (setsockopt(m_sockfd, SOL_CAN_RAW, CAN_RAW_FILTER,
+                   &rfilter, sizeof(rfilter)) < 0)
+    {
+        m_logger.error("SocketCAN: CAN_RAW_FILTER setsockopt failed: %s",
+                       strerror(errno));
+        return Error_t::INITIALIZATION_ERROR;
+    }
+    m_logger.info("SocketCAN: filter set for motor_id=0x%X (mask=0x%X)",
+                  static_cast<unsigned>(motor_id),
+                  static_cast<unsigned>(CAN_SFF_MASK));
     return Error_t::OK;
 }
 
