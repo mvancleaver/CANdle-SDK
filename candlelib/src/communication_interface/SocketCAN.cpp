@@ -180,13 +180,22 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
         return Error_t::DATA_EMPTY;
     }
 
-    // Parse envelope: length field = payload_bytes + 2 (for the 2 CAN-ID bytes).
+    // Parse envelope. CORRECTION (Plan 07.1-03 live debug 2026-05-05):
+    // Plan 02 originally read this as "env_len = payload_bytes + 2". WRONG.
+    // The SDK's sendCanFrameHeader (candle.hpp:174) builds the envelope as:
+    //   {GENERIC_CAN_FRAME, u8(length /*id + DLC*/), timeout, u8(id), u8(id >> 8)}
+    // where `length` = `dataToSend.size()` from the call site — the ACTUAL
+    // user payload length, not payload+2. The "/* id + DLC */" comment in the
+    // SDK is misleading; it's not adding bytes for the ID. Empirical evidence:
+    // a 4-byte READ_REGISTER frame [0x41, 0x00, reg_lo, reg_hi] arrives here
+    // with env_len=4 (not 6), and we previously dropped to len=2, sending only
+    // [0x41, 0x00] over the wire — motor sees malformed frame, never responds.
     const uint8_t env_len    = data[ENV_LEN];
     const uint8_t id_lo      = data[ENV_ID_LO];
     const uint8_t id_hi      = data[ENV_ID_HI];
     const uint32_t can_id    = static_cast<uint32_t>(id_lo) |
                                (static_cast<uint32_t>(id_hi) << 8);
-    const uint8_t payload_len = (env_len >= 2) ? (env_len - 2) : 0;
+    const uint8_t payload_len = env_len;  // Direct: env_len IS the payload size.
 
     if (data.size() < ENV_PAYLOAD + payload_len)
     {
@@ -195,17 +204,47 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
         return Error_t::DATA_TOO_LONG;
     }
 
+    // CAN-FD requires `len` to be a valid DLC: 0..8, 12, 16, 20, 24, 32, 48, 64.
+    // Non-DLC values are silently dropped by the kernel TX layer (counted in
+    // `ip -s link show <iface>` under TX dropped). Pad up to the next DLC.
+    auto pad_to_dlc = [](uint8_t n) -> uint8_t {
+        if (n <= 8)  return n;
+        if (n <= 12) return 12;
+        if (n <= 16) return 16;
+        if (n <= 20) return 20;
+        if (n <= 24) return 24;
+        if (n <= 32) return 32;
+        if (n <= 48) return 48;
+        return 64;
+    };
+    const uint8_t dlc_len = pad_to_dlc(payload_len);
+
     // Build canfd_frame
     struct canfd_frame txf{};
     txf.can_id = can_id;  // standard 11-bit or 29-bit; kernel handles EFF flag
-    txf.len    = payload_len;
-    txf.flags  = CANFD_BRS;  // Bit Rate Switch — enables data-phase rate (5M on X8)
+    txf.len    = dlc_len;
+    // CANFD_FDF (0x04) marks the frame as CAN-FD format (some kernels require
+    // this explicitly even with CAN_RAW_FD_FRAMES setsockopt enabled).
+    // CANFD_BRS  (0x01) enables data-phase bit-rate switch (5M on X8).
+    txf.flags  = CANFD_BRS | CANFD_FDF;
     if (payload_len > 0)
     {
         std::memcpy(txf.data, data.data() + ENV_PAYLOAD, payload_len);
+        // Pad bytes already zero-initialized by `{}` above.
     }
 
-    m_logger.debug("SocketCAN: TX canfd_frame id=0x%03X len=%u", can_id, payload_len);
+    // Phase 07.1-03 diagnostic: dump TX frame at INFO so we can see what's
+    // actually being sent and correlate with candump captures.
+    {
+        char hex[256];
+        size_t off = 0;
+        for (size_t i = 0; i < payload_len && off + 3 < sizeof(hex); ++i) {
+            off += static_cast<size_t>(std::snprintf(hex + off, sizeof(hex) - off,
+                                                     "%02X ", txf.data[i]));
+        }
+        m_logger.info("SocketCAN: TX canfd_frame id=0x%03X len=%u flags=0x%02X data=[ %s]",
+                      can_id, payload_len, static_cast<unsigned>(txf.flags), hex);
+    }
 
     // Write with ENOBUFS retry (Pitfall 3: kernel TX ring full under high load)
     ssize_t written = write(m_sockfd, &txf, sizeof(txf));
@@ -228,6 +267,15 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
             m_logger.error("SocketCAN: write() failed: %s", strerror(errno));
             return Error_t::TRANSMITTER_ERROR;
         }
+    }
+
+    // Diagnostic: report short-write (kernel may have truncated to classic CAN if
+    // CAN_RAW_FD_FRAMES setsockopt failed silently or was reset).
+    if (written != static_cast<ssize_t>(sizeof(txf)))
+    {
+        m_logger.error("SocketCAN: short write — wrote %zd of %zu bytes (kernel may have "
+                       "fallen back to classic CAN; verify CAN_RAW_FD_FRAMES is enabled)",
+                       written, sizeof(txf));
     }
 
     return Error_t::OK;
