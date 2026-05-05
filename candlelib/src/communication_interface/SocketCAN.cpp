@@ -318,13 +318,32 @@ SocketCAN::transfer(std::vector<u8> data, const u32 timeoutMs,
 
     // ── cmd=2: CANDLE_CONFIG_DATARATE — synthesize response (Pitfall 4) ──────
     // legacyCheckConnection() sends this and expects 6 bytes back.
-    // SocketCAN has no USB-dongle handshake; return synthetic 6-byte OK.
+    // The 6-byte buffer is also parsed by Candle::getCandleVersion() during
+    // MD::init():
+    //   buffer[2] = version.tag
+    //   buffer[3] = version.revision
+    //   buffer[4] = version.minor
+    //   buffer[5] = version.major
+    // If this resolves to major<2 OR (major==2 AND minor<4) the SDK fires the
+    // "old CANdle firmware" warning AND switches MD::init() onto the legacy
+    // v1 register protocol — which modern motor firmware (v2.5.x+) does not
+    // speak, causing readRegister() to time out silently.
+    //
+    // SocketCAN has no real USB-dongle handshake; we synthesize CANdle v2.5.0
+    // (major=2, minor=5) so the SDK uses its modern register protocol path.
     if (cmd == CANDLE_CONFIG_DATARATE)
     {
-        m_logger.info("SocketCAN: CANDLE_CONFIG_DATARATE (cmd=2) — synthesizing 6-byte OK response "
-                      "(no USB-dongle handshake over SocketCAN)");
+        m_logger.info("SocketCAN: CANDLE_CONFIG_DATARATE (cmd=2) — synthesizing 6-byte response "
+                      "with CANdle v2.5.0 version (no USB-dongle on SOCKETCAN)");
         const size_t resp_size = (expectedReceivedDataSize > 0) ? expectedReceivedDataSize : 6;
         std::vector<u8> synth(resp_size, 0);
+        if (resp_size >= 6)
+        {
+            synth[2] = 0;  // tag
+            synth[3] = 0;  // revision
+            synth[4] = 5;  // minor (v2.5)
+            synth[5] = 2;  // major (v2)
+        }
         return {synth, Error_t::OK};
     }
 
