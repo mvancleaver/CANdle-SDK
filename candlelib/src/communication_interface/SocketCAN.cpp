@@ -294,10 +294,23 @@ SocketCAN::recv_can_frame(u32 timeoutMs, size_t expectedSize)
 {
     std::vector<u8> result(expectedSize, 0);
 
+    // Phase 07.1.2 follow-up — enforce a minimum recv timeout that accounts for
+    // the X8H7 SPI bridge round-trip latency. The CANdle SDK was designed for
+    // USB-CANdle's ~1ms latency profile, so DEFAULT_CAN_TIMEOUT=1ms + the SDK's
+    // +10 padding gives 11ms passed in here. The X8 SPI bridge has ~95ms total
+    // round-trip per Phase 07.1.2 dmesg analysis (start_xmit @ t0, motor
+    // response delivered to can1 @ t0+94.5ms). At 11ms the recvfrom() returns
+    // EAGAIN BEFORE the motor's response arrives at the kernel — the response
+    // is then orphaned in the kernel buffer. Floor the timeout at 200ms so the
+    // SPI bridge round-trip has comfortable headroom.
+    constexpr u32 SPI_BRIDGE_MIN_TIMEOUT_MS = 200;
+    const u32 effective_timeout = (timeoutMs < SPI_BRIDGE_MIN_TIMEOUT_MS)
+                                  ? SPI_BRIDGE_MIN_TIMEOUT_MS : timeoutMs;
+
     // Set per-call receive timeout via SO_RCVTIMEO
     struct timeval tv{};
-    tv.tv_sec  = static_cast<long>(timeoutMs / 1000U);
-    tv.tv_usec = static_cast<long>((timeoutMs % 1000U) * 1000L);
+    tv.tv_sec  = static_cast<long>(effective_timeout / 1000U);
+    tv.tv_usec = static_cast<long>((effective_timeout % 1000U) * 1000L);
     setsockopt(m_sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     struct canfd_frame rxf{};
@@ -306,7 +319,8 @@ SocketCAN::recv_can_frame(u32 timeoutMs, size_t expectedSize)
     {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
         {
-            m_logger.error("SocketCAN: recvfrom() timeout after %u ms", timeoutMs);
+            m_logger.error("SocketCAN: recvfrom() timeout after %u ms (caller asked %u ms; floored to SPI-bridge minimum)",
+                           effective_timeout, timeoutMs);
             return {result, Error_t::TIMEOUT};
         }
         m_logger.error("SocketCAN: recvfrom() failed: %s", strerror(errno));
