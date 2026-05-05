@@ -38,7 +38,10 @@ message(
 )
 
 if(UNIX)
-  set(UNIX_ONLY_SOURCES src/communication_interface/SPI.cpp)
+  # Phase 07.1 D-02: SocketCAN backend added alongside SPI (Linux-only; uses AF_CAN kernel subsystem)
+  set(UNIX_ONLY_SOURCES
+      src/communication_interface/SPI.cpp
+      src/communication_interface/SocketCAN.cpp)
 endif()
 
 target_sources(
@@ -133,6 +136,15 @@ if(MAKE_TESTS)
     target_include_directories(spi_v2_test PRIVATE include
                                                    src/communication_interface/)
     target_link_libraries(spi_v2_test PRIVATE logger shared_data candle)
+
+    # Phase 07.1 D-02: SocketCAN backend unit tests (vcan0-based; skip-on-no-vcan0 in test fixture)
+    add_unit_test_executable(socketcan_v2_test
+                             src/communication_interface/SocketCAN_test.cpp)
+    target_sources(socketcan_v2_test PRIVATE src/communication_interface/SocketCAN.cpp)
+    target_include_directories(socketcan_v2_test PRIVATE include
+                                                         src/communication_interface/
+                                                         src/communication_device/)
+    target_link_libraries(socketcan_v2_test PRIVATE logger shared_data candle)
   endif()
 
   add_unit_test_executable(md_v2_test src/MD/MD_test.cpp)

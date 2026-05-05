@@ -16,6 +16,7 @@
 #include "I_communication_interface.hpp"
 #include "USB.hpp"
 #include "SPI.hpp"
+#include "SocketCAN.hpp"  // Phase 07.1 D-02: SocketCAN backend
 #include "mab_types.hpp"
 #include "candle_frame_adapter.hpp"
 #include "candle_frame_dto.hpp"
@@ -229,10 +230,43 @@ namespace mab
                 if (bus->connect() != mab::I_CommunicationInterface::Error_t::OK)
                     throw std::runtime_error("Could not connect SPI device!");
                 return attachCandle(datarate, std::move(bus));
+            // Phase 07.1 D-02: SocketCAN backend for X8 i.MX 8M Mini local CAN-FD
+            // Default interface "can1" = FDCAN2 on Portenta X8 carrier hat (external bus).
+            // Use attachCandle(datarate, busType, ifname) overload to specify a different interface.
+            case candleTypes::busTypes_t::SOCKETCAN:
+            {
+                bus = std::make_unique<mab::SocketCAN>("can1");
+                if (bus->connect() != mab::I_CommunicationInterface::Error_t::OK)
+                    throw std::runtime_error("Could not connect SocketCAN device can1");
+                return attachCandle(datarate, std::move(bus));
+            }
             default:
                 throw std::runtime_error("Wrong communication interface provided!");
                 return {};
         }
+    }
+
+    /// @brief Create CANdle device instance with named SocketCAN interface (Phase 07.1 D-02).
+    ///        For USB/SPI the ifname is ignored; use the two-argument overload instead.
+    /// @param datarate Target data-rate of the CAN bus
+    /// @param busType Bus type (USB, SPI, or SOCKETCAN)
+    /// @param ifname SocketCAN interface name (e.g. "can1", "vcan0") — used only for SOCKETCAN
+    /// @return Configured candle object or nullptr
+    inline mab::Candle* attachCandle(const CANdleDatarate_E  datarate,
+                                     candleTypes::busTypes_t busType,
+                                     std::optional<std::string> ifname)
+    {
+        if (busType == candleTypes::busTypes_t::SOCKETCAN)
+        {
+            std::unique_ptr<mab::I_CommunicationInterface> bus;
+            std::string device = ifname.value_or("can1");
+            bus = std::make_unique<mab::SocketCAN>(device);
+            if (bus->connect() != mab::I_CommunicationInterface::Error_t::OK)
+                throw std::runtime_error("Could not connect SocketCAN device " + device);
+            return attachCandle(datarate, std::move(bus));
+        }
+        // For USB/SPI, delegate to the two-argument overload (ifname ignored)
+        return attachCandle(datarate, busType);
     }
 
     /// @brief Destroy candle object. Must be called after each initialization of CANdle
@@ -286,6 +320,18 @@ namespace mab
                         return {};
                     }
                     break;
+                // Phase 07.1 D-02: SocketCAN backend for X8 i.MX 8M Mini local CAN-FD
+                case candleTypes::busTypes_t::SOCKETCAN:
+                {
+                    std::string ifname = std::string(pathOrId.value_or("can1"));
+                    bus = std::make_unique<mab::SocketCAN>(ifname);
+                    if (bus->connect() != I_CommunicationInterface::Error_t::OK)
+                    {
+                        m_logger.error("Could not connect SocketCAN device %s!", ifname.c_str());
+                        return {};
+                    }
+                    break;
+                }
                 default:
                     m_logger.error("Unimplemented bus type");
                     return {};

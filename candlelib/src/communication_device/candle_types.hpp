@@ -30,7 +30,8 @@ namespace mab
         enum busTypes_t
         {
             USB,
-            SPI
+            SPI,
+            SOCKETCAN  // Phase 07.1 D-02: SocketCAN backend for X8 i.MX 8M Mini local CAN-FD
         };
 
         struct CANFrameData_t
