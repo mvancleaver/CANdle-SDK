@@ -233,17 +233,21 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
         // Pad bytes already zero-initialized by `{}` above.
     }
 
-    // Phase 07.1-03 diagnostic: dump TX frame at INFO so we can see what's
-    // actually being sent and correlate with candump captures.
+    // Phase 07.1-03 diagnostic: dump TX frame at ERROR so we can see what's
+    // actually being sent (Logger default verbosity filters INFO/DEBUG).
     {
         char hex[256];
         size_t off = 0;
-        for (size_t i = 0; i < payload_len && off + 3 < sizeof(hex); ++i) {
+        for (size_t i = 0; i < dlc_len && off + 3 < sizeof(hex); ++i) {
             off += static_cast<size_t>(std::snprintf(hex + off, sizeof(hex) - off,
                                                      "%02X ", txf.data[i]));
         }
-        m_logger.info("SocketCAN: TX canfd_frame id=0x%03X len=%u flags=0x%02X data=[ %s]",
-                      can_id, payload_len, static_cast<unsigned>(txf.flags), hex);
+        std::fprintf(stderr,
+                     "[SocketCAN-DIAG] TX canfd_frame id=0x%03X dlc_len=%u (orig payload_len=%u) "
+                     "flags=0x%02X data=[ %s]\n",
+                     can_id, static_cast<unsigned>(dlc_len),
+                     static_cast<unsigned>(payload_len),
+                     static_cast<unsigned>(txf.flags), hex);
     }
 
     // Write with ENOBUFS retry (Pitfall 3: kernel TX ring full under high load)
