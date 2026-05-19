@@ -38,10 +38,12 @@
 #include <cstring>
 #include <thread>
 #include <chrono>
+#include <algorithm>
 
 #include <linux/can.h>
 #include <linux/can/raw.h>
 #include <net/if.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -280,9 +282,106 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
         if (n <= 48) return 48;
         return 64;
     };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 7.4.27 Plan 01 ENOBUFS retry helper (D-27-01, replaces fixed 1ms
+    // sleep_for). The x8h7_can kernel module's start_xmit() calls
+    // netif_stop_queue() unconditionally (single-slot TX qdisc; wake only on
+    // H7 SPI bridge's TX_COMPLETE callback at netif_wake_queue, ~95ms RTT per
+    // Phase 7.1.2 dmesg analysis). Fixed 1ms sleep was 91.6% of Phase 7.4.26
+    // H1 soak failures. poll(POLLOUT, 100ms) gives the qdisc a bounded drain
+    // window that matches the empirical SPI-bridge RTT.
+    //
+    // Threat T-27-01-E mitigation: single retry semantics preserved (poll →
+    // retry once → fail with TRANSMITTER_ERROR if still ENOBUFS).
+    //
+    // Mirrored across the classic-CAN and CAN-FD branches with the matching
+    // struct + size (T-26-01-T2 invariant: wrong-size-on-retry impossible).
+    // ─────────────────────────────────────────────────────────────────────────
+    constexpr int ENOBUFS_POLL_TIMEOUT_MS = 100;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 7.4.26 Plan 01 (D-26-01) classic-vs-FD struct + size split.
+    //
+    // MD80 firmware v2.5.4.r empirically requires CLASSIC CAN framing for
+    // short reads (payload <= 8 bytes) per the 190-frame candletool oracle
+    // capture (runs/phase07.4.25-firstlight/20260519T093955Z-candletool-oracle-capture/).
+    //
+    // The Linux kernel discriminates classic-vs-FD by write() length (skb->len),
+    // NOT by CANFD_FDF flag — verified at include/linux/can/skb.h::can_is_canfd_skb.
+    // Therefore the fix is a struct + size split, not a flag tweak.
+    //
+    //   payload_len <= 8  →  struct can_frame   (16-byte write)
+    //   payload_len  > 8  →  struct canfd_frame (72-byte write, BRS+FDF)
+    //
+    // Phase 7.4.27 Plan 01 (D-27-01) ENOBUFS handling layered in via
+    // poll(POLLOUT) helper inside each branch with the matching struct size.
+    // ─────────────────────────────────────────────────────────────────────────
+    if (payload_len <= 8)
+    {
+        // ── CLASSIC CAN branch (TX classic can_frame) ───────────────────────
+        struct can_frame cf{};
+        cf.can_id = can_id;  // standard 11-bit or 29-bit; kernel handles EFF flag
+        cf.can_dlc = payload_len;  // classic CAN DLC is the raw payload byte count
+        if (payload_len > 0)
+        {
+            std::memcpy(cf.data, data.data() + ENV_PAYLOAD, payload_len);
+        }
+
+        // Phase 07.1-03 diagnostic: dump TX frame at ERROR so we can see what's
+        // actually being sent (Logger default verbosity filters INFO/DEBUG).
+        // Phase 7.4.26 Plan 01 marker: "TX classic can_frame" — load-bearing for
+        // structural verification that the classic-vs-FD split is present.
+        {
+            char hex[256];
+            size_t off = 0;
+            for (size_t i = 0; i < payload_len && off + 3 < sizeof(hex); ++i) {
+                off += static_cast<size_t>(std::snprintf(hex + off, sizeof(hex) - off,
+                                                         "%02X ", cf.data[i]));
+            }
+            std::fprintf(stderr,
+                         "[SocketCAN-DIAG] TX classic can_frame id=0x%03X dlc=%u "
+                         "data=[ %s]\n",
+                         can_id, static_cast<unsigned>(cf.can_dlc), hex);
+        }
+
+        ssize_t written = write(m_sockfd, &cf, sizeof(cf));
+        if (written < 0 && errno == ENOBUFS)
+        {
+            // Phase 7.4.27 D-27-01 — poll(POLLOUT) replaces fixed 1ms sleep.
+            // Bounded TX-queue drain window matching SPI bridge ~95ms RTT.
+            struct pollfd pfd = { m_sockfd, POLLOUT, 0 };
+            int pr = ::poll(&pfd, 1, ENOBUFS_POLL_TIMEOUT_MS);
+            if (pr > 0 && (pfd.revents & POLLOUT))
+            {
+                written = write(m_sockfd, &cf, sizeof(cf));
+            }
+            if (written < 0)
+            {
+                m_logger.error(
+                    "SocketCAN: classic write() ENOBUFS persisted after %dms poll(POLLOUT): %s",
+                    ENOBUFS_POLL_TIMEOUT_MS, strerror(errno));
+                return Error_t::TRANSMITTER_ERROR;
+            }
+        }
+        else if (written < 0)
+        {
+            m_logger.error("SocketCAN: classic write() failed: %s", strerror(errno));
+            return Error_t::TRANSMITTER_ERROR;
+        }
+
+        if (written != static_cast<ssize_t>(sizeof(cf)))
+        {
+            m_logger.error("SocketCAN: classic short write — wrote %zd of %zu bytes",
+                           written, sizeof(cf));
+        }
+
+        return Error_t::OK;
+    }
+
+    // ── CAN-FD branch (payload > 8: BRS data phase) ─────────────────────────
     const uint8_t dlc_len = pad_to_dlc(payload_len);
 
-    // Build canfd_frame
     struct canfd_frame txf{};
     txf.can_id = can_id;  // standard 11-bit or 29-bit; kernel handles EFF flag
     txf.len    = dlc_len;
@@ -313,34 +412,37 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
                      static_cast<unsigned>(txf.flags), hex);
     }
 
-    // Write with ENOBUFS retry (Pitfall 3: kernel TX ring full under high load)
+    // Write with ENOBUFS retry — Phase 7.4.27 D-27-01: poll(POLLOUT) replaces
+    // fixed 1ms sleep_for to give the x8h7_can single-slot qdisc a bounded
+    // drain window matching the SPI bridge RTT (~95ms).
     ssize_t written = write(m_sockfd, &txf, sizeof(txf));
-    if (written < 0)
+    if (written < 0 && errno == ENOBUFS)
     {
-        if (errno == ENOBUFS)
+        struct pollfd pfd = { m_sockfd, POLLOUT, 0 };
+        int pr = ::poll(&pfd, 1, ENOBUFS_POLL_TIMEOUT_MS);
+        if (pr > 0 && (pfd.revents & POLLOUT))
         {
-            // One retry after 1 ms (kernel TX queue drain)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             written = write(m_sockfd, &txf, sizeof(txf));
-            if (written < 0)
-            {
-                m_logger.error("SocketCAN: write() ENOBUFS after retry — TX queue full: %s",
-                               strerror(errno));
-                return Error_t::TRANSMITTER_ERROR;
-            }
         }
-        else
+        if (written < 0)
         {
-            m_logger.error("SocketCAN: write() failed: %s", strerror(errno));
+            m_logger.error(
+                "SocketCAN: FD write() ENOBUFS persisted after %dms poll(POLLOUT): %s",
+                ENOBUFS_POLL_TIMEOUT_MS, strerror(errno));
             return Error_t::TRANSMITTER_ERROR;
         }
+    }
+    else if (written < 0)
+    {
+        m_logger.error("SocketCAN: FD write() failed: %s", strerror(errno));
+        return Error_t::TRANSMITTER_ERROR;
     }
 
     // Diagnostic: report short-write (kernel may have truncated to classic CAN if
     // CAN_RAW_FD_FRAMES setsockopt failed silently or was reset).
     if (written != static_cast<ssize_t>(sizeof(txf)))
     {
-        m_logger.error("SocketCAN: short write — wrote %zd of %zu bytes (kernel may have "
+        m_logger.error("SocketCAN: FD short write — wrote %zd of %zu bytes (kernel may have "
                        "fallen back to classic CAN; verify CAN_RAW_FD_FRAMES is enabled)",
                        written, sizeof(txf));
     }
@@ -357,33 +459,56 @@ SocketCAN::recv_can_frame(u32 timeoutMs, size_t expectedSize)
 {
     std::vector<u8> result(expectedSize, 0);
 
-    // Phase 07.1.2 follow-up — enforce a minimum recv timeout that accounts for
-    // the X8H7 SPI bridge round-trip latency. The CANdle SDK was designed for
-    // USB-CANdle's ~1ms latency profile, so DEFAULT_CAN_TIMEOUT=1ms + the SDK's
-    // +10 padding gives 11ms passed in here. The X8 SPI bridge has ~95ms total
-    // round-trip per Phase 07.1.2 dmesg analysis (start_xmit @ t0, motor
-    // response delivered to can1 @ t0+94.5ms). At 11ms the recvfrom() returns
-    // EAGAIN BEFORE the motor's response arrives at the kernel — the response
-    // is then orphaned in the kernel buffer. Floor the timeout at 200ms so the
-    // SPI bridge round-trip has comfortable headroom.
-    constexpr u32 SPI_BRIDGE_MIN_TIMEOUT_MS = 200;
-    const u32 effective_timeout = (timeoutMs < SPI_BRIDGE_MIN_TIMEOUT_MS)
-                                  ? SPI_BRIDGE_MIN_TIMEOUT_MS : timeoutMs;
+    // Phase 7.4.27 Plan 01 (D-27-01) — replace blocking recvfrom + SO_RCVTIMEO
+    // (which used a 200ms floor that multiplied across consecutive timeouts:
+    // Phase 7.4.26 H1 saw 261 timeouts × 200ms = 52.2s of dead time in a 60s
+    // soak window). Switch to edge-triggered poll(POLLIN, timeoutMs) +
+    // recvfrom(MSG_DONTWAIT) so the caller's actual timeout is honored.
+    //
+    // Phase 7.4.27 Plan 02 Tier 3 remediation (post-diagnostic 2026-05-19):
+    // Plan 01 chose 50ms as A1 (Assumption #1) based on Phase 7.1.2 dmesg
+    // analysis predicting ~95ms SPI-bridge RTT. The 2026-05-19 diagnostic
+    // bench (runs/phase07.4.27-fix/20260519T200921Z-diagnostic-tx-enobufs/)
+    // observed motor round-trip is actually 35–70ms (not 95ms). The 50ms
+    // floor times out 42% of legitimate motor reads. Raise the floor to
+    // 100ms — 30ms margin above the empirical 70ms ceiling, well below the
+    // single-call SDK budget (1000ms typical). Bench expectation: rate
+    // climbs from 23.7Hz (diagnostic) → 100–300Hz range. Sub-500Hz still
+    // flags downstream rate-limiter for future plan.
+    constexpr u32 SPI_BRIDGE_MIN_TIMEOUT_MS = 100;
+    const u32 effective_timeout = std::max(timeoutMs, SPI_BRIDGE_MIN_TIMEOUT_MS);
 
-    // Set per-call receive timeout via SO_RCVTIMEO
-    struct timeval tv{};
-    tv.tv_sec  = static_cast<long>(effective_timeout / 1000U);
-    tv.tv_usec = static_cast<long>((effective_timeout % 1000U) * 1000L);
-    setsockopt(m_sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct pollfd pfd = { m_sockfd, POLLIN, 0 };
+    int pr = ::poll(&pfd, 1, static_cast<int>(effective_timeout));
+    if (pr == 0)
+    {
+        m_logger.error("SocketCAN: poll(POLLIN) timeout after %u ms (caller asked %u ms; floor %u ms)",
+                       effective_timeout, timeoutMs,
+                       static_cast<unsigned>(SPI_BRIDGE_MIN_TIMEOUT_MS));
+        return {result, Error_t::TIMEOUT};
+    }
+    if (pr < 0)
+    {
+        if (errno == EINTR)
+        {
+            m_logger.error("SocketCAN: poll(POLLIN) interrupted (EINTR) — treating as TIMEOUT");
+            return {result, Error_t::TIMEOUT};
+        }
+        m_logger.error("SocketCAN: poll(POLLIN) failed: %s", strerror(errno));
+        return {result, Error_t::RECEIVER_ERROR};
+    }
 
     struct canfd_frame rxf{};
-    ssize_t n = recvfrom(m_sockfd, &rxf, sizeof(rxf), 0, nullptr, nullptr);
+    ssize_t n = recvfrom(m_sockfd, &rxf, sizeof(rxf), MSG_DONTWAIT, nullptr, nullptr);
     if (n < 0)
     {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
         {
-            m_logger.error("SocketCAN: recvfrom() timeout after %u ms (caller asked %u ms; floored to SPI-bridge minimum)",
-                           effective_timeout, timeoutMs);
+            // poll(POLLIN) returned ready but recvfrom got EAGAIN — rare race
+            // (frame consumed by another reader on the same socket, or stale
+            // POLLIN). Caller deadline already paid via poll; report TIMEOUT.
+            m_logger.error("SocketCAN: recvfrom(MSG_DONTWAIT) EAGAIN after POLLIN ready (caller asked %u ms)",
+                           timeoutMs);
             return {result, Error_t::TIMEOUT};
         }
         m_logger.error("SocketCAN: recvfrom() failed: %s", strerror(errno));
