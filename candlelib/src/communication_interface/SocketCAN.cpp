@@ -468,14 +468,18 @@ SocketCAN::recv_can_frame(u32 timeoutMs, size_t expectedSize)
     // Phase 7.4.27 Plan 02 Tier 3 remediation (post-diagnostic 2026-05-19):
     // Plan 01 chose 50ms as A1 (Assumption #1) based on Phase 7.1.2 dmesg
     // analysis predicting ~95ms SPI-bridge RTT. The 2026-05-19 diagnostic
-    // bench (runs/phase07.4.27-fix/20260519T200921Z-diagnostic-tx-enobufs/)
-    // observed motor round-trip is actually 35–70ms (not 95ms). The 50ms
-    // floor times out 42% of legitimate motor reads. Raise the floor to
-    // 100ms — 30ms margin above the empirical 70ms ceiling, well below the
-    // single-call SDK budget (1000ms typical). Bench expectation: rate
-    // climbs from 23.7Hz (diagnostic) → 100–300Hz range. Sub-500Hz still
-    // flags downstream rate-limiter for future plan.
-    constexpr u32 SPI_BRIDGE_MIN_TIMEOUT_MS = 100;
+    // observed successful motor round-trip is 35-70ms (not 95ms), but the
+    // FAILED reads (39% of attempts) bottleneck at the floor regardless of
+    // value — motor genuinely doesn't reply within the SDK budget for those
+    // calls. Empirical retest (Plan 02 §12; commit d3c9d54 floor=100) showed
+    // mean_rate_hz=10.6 vs the 50ms floor's 23.7 (-55%). Higher floor strictly
+    // multiplies the per-timeout cost and does NOT recover misses, because
+    // misses are a per-call protocol/pacing problem (smart-MD reg-read schema,
+    // SDK timing window — captured for Phase 7.4.28), not a transport-layer
+    // floor problem. REVERTED to 50ms. The real blocker for sustained 500 Hz
+    // is per-call protocol pacing (Phase 7.4.28 forecast in 07.4.27 Plan 04
+    // close-out), not the poll(POLLIN) floor.
+    constexpr u32 SPI_BRIDGE_MIN_TIMEOUT_MS = 50;
     const u32 effective_timeout = std::max(timeoutMs, SPI_BRIDGE_MIN_TIMEOUT_MS);
 
     struct pollfd pfd = { m_sockfd, POLLIN, 0 };
