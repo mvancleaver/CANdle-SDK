@@ -39,6 +39,8 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 
 #include <linux/can.h>
 #include <linux/can/raw.h>
@@ -72,6 +74,53 @@ SocketCAN::SocketCAN(std::string_view ifname, std::optional<canId_t> filter_id)
 SocketCAN::~SocketCAN()
 {
     disconnect();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 7.4.28 + 7.4.29 instrumentation accessors (env-var-gated read-only)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Counter C (recv_ok_count) — added in Phase 7.4.29 Plan 01 Task 3 for the
+// Tier 1 counter-bench (seam attribution between kernel netif_rx and userspace
+// recvfrom). Counts every recvfrom that returns n > 0 successfully.
+//
+// recv_attempts + eagain_count — re-authored Phase 7.4.29 Plan 01 Task 3
+// (Case A reconcile). Phase 7.4.28 Plan 01 instrumentation was preserved at
+// submodule HEAD 5f8a8de in STATE.md but that commit was never pushed to any
+// remote (origin/fork/upstream) and is unrecoverable from this working tree's
+// 9159b65 HEAD. Re-authoring the symbols here so that scripts/diag/
+// socketcan_motor_smoke.cpp's extern "C" references resolve at link time.
+//
+// All atomics use memory_order_relaxed — they are diagnostic counters with no
+// happens-before guarantees relative to data; one branch per increment.
+// Production cost = ~1 ns per increment; zero cost when smoke binary is not
+// using the recv path.
+static std::atomic<std::uint64_t> g_phase_7_4_28_recv_attempts{0};
+static std::atomic<std::uint64_t> g_phase_7_4_28_eagain_count{0};
+static std::atomic<std::uint64_t> g_phase_7_4_29_recv_ok_count{0};
+
+extern "C" unsigned long phase_7_4_28_get_recv_attempts(void)
+{
+    return static_cast<unsigned long>(
+        g_phase_7_4_28_recv_attempts.load(std::memory_order_relaxed));
+}
+extern "C" unsigned long phase_7_4_28_get_eagain_count(void)
+{
+    return static_cast<unsigned long>(
+        g_phase_7_4_28_eagain_count.load(std::memory_order_relaxed));
+}
+extern "C" std::uint64_t phase_7_4_29_get_recv_ok_count(void)
+{
+    return g_phase_7_4_29_recv_ok_count.load(std::memory_order_relaxed);
+}
+extern "C" void phase_7_4_29_reset_recv_ok_count(void)
+{
+    g_phase_7_4_29_recv_ok_count.store(0, std::memory_order_relaxed);
+}
+extern "C" void phase_7_4_28_reset_counters(void)
+{
+    g_phase_7_4_28_recv_attempts.store(0, std::memory_order_relaxed);
+    g_phase_7_4_28_eagain_count.store(0, std::memory_order_relaxed);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -457,6 +506,9 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
 std::pair<std::vector<u8>, I_CommunicationInterface::Error_t>
 SocketCAN::recv_can_frame(u32 timeoutMs, size_t expectedSize)
 {
+    // Phase 7.4.28 instrumentation: count every entry as one recv attempt.
+    g_phase_7_4_28_recv_attempts.fetch_add(1, std::memory_order_relaxed);
+
     std::vector<u8> result(expectedSize, 0);
 
     // Phase 7.4.27 Plan 01 (D-27-01) — replace blocking recvfrom + SO_RCVTIMEO
@@ -508,6 +560,8 @@ SocketCAN::recv_can_frame(u32 timeoutMs, size_t expectedSize)
     {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
         {
+            // Phase 7.4.28 instrumentation: count EAGAIN-after-POLLIN-ready races.
+            g_phase_7_4_28_eagain_count.fetch_add(1, std::memory_order_relaxed);
             // poll(POLLIN) returned ready but recvfrom got EAGAIN — rare race
             // (frame consumed by another reader on the same socket, or stale
             // POLLIN). Caller deadline already paid via poll; report TIMEOUT.
@@ -536,6 +590,12 @@ SocketCAN::recv_can_frame(u32 timeoutMs, size_t expectedSize)
     {
         result[2 + i] = rxf.data[i];
     }
+
+    // Phase 7.4.29 Plan 01 Task 3 — Counter C (recv_ok_count) atomic increment
+    // on every successful recvfrom (n > 0). Symmetric to Phase 7.4.28 counters;
+    // load-bearing differential for Branch D Tier 1 seam attribution (vs kernel
+    // rx_packets at netif_rx callsite x8h7_can.c:233).
+    g_phase_7_4_29_recv_ok_count.fetch_add(1, std::memory_order_relaxed);
 
     m_logger.debug("SocketCAN: RX canfd_frame id=0x%03X len=%u", rxf.can_id & CAN_EFF_MASK, rxf.len);
     return {result, Error_t::OK};
