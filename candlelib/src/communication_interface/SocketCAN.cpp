@@ -140,6 +140,42 @@ I_CommunicationInterface::Error_t SocketCAN::connect()
         return Error_t::INITIALIZATION_ERROR;
     }
 
+    // Step 1b (Phase 07.4.42.1 T1): Enlarge RX/TX kernel socket buffers.
+    //
+    // Sizing rationale: 6 motors × 24 B 0xA0 ACK at 500 Hz ≈ 72 KB/s steady;
+    // 1 MiB RCVBUF absorbs ~10 s of full-rate backlog during transient scheduling
+    // stalls (e.g. SPI bridge back-pressure). 512 KiB SNDBUF covers batched
+    // 6-motor TX bursts.
+    //
+    // The kernel doubles SO_RCVBUF and clamps to net.core.rmem_max.
+    // ophanim-can-setup.service's ExecStartPre raises rmem_max to 2 MiB (2097152)
+    // so the 1 MiB request (doubled = 2 MiB) is honored without SO_RCVBUFFORCE.
+    // We verify effective size after setting and log WARNING if clamped
+    // (Pitfall 5 from RESEARCH.md §T1).
+    {
+        int rcvbuf = 1 << 20;  // 1 MiB requested (kernel will double)
+        int sndbuf = 1 << 19;  // 512 KiB requested (kernel will double)
+        setsockopt(m_sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        setsockopt(m_sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        // Verify effective size: getsockopt reports the already-doubled value.
+        // If eff_rcv < (rcvbuf * 2), rmem_max clamped us — log a warning.
+        int eff_rcv = 0;
+        socklen_t eff_len = sizeof(eff_rcv);
+        getsockopt(m_sockfd, SOL_SOCKET, SO_RCVBUF, &eff_rcv, &eff_len);
+        if (eff_rcv < rcvbuf * 2)
+        {
+            m_logger.error("SocketCAN: SO_RCVBUF clamped — requested %d bytes (doubled %d), "
+                           "effective %d bytes. Raise net.core.rmem_max or check "
+                           "ophanim-can-setup.service ExecStartPre.",
+                           rcvbuf, rcvbuf * 2, eff_rcv);
+        }
+        else
+        {
+            m_logger.info("SocketCAN: SO_RCVBUF effective=%d bytes (requested %d; kernel doubled)",
+                          eff_rcv, rcvbuf);
+        }
+    }
+
     // Step 2: Enable CAN-FD frames (required for CANFD_BRS + 64-byte payloads).
     int enable = 1;
     if (setsockopt(m_sockfd, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &enable, sizeof(enable)) < 0)
