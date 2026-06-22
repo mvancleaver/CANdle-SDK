@@ -238,6 +238,35 @@ I_CommunicationInterface::Error_t SocketCAN::connect()
     int loopback = 0;
     setsockopt(m_sockfd, SOL_CAN_RAW, CAN_RAW_LOOPBACK, &loopback, sizeof(loopback));
 
+    // Phase 07.4.42.1 T4 -- Enable error-frame delivery (CAN_RAW_ERR_FILTER).
+    // CAN_RAW_ERR_FILTER is INDEPENDENT of CAN_RAW_FILTER: error frames (those
+    // with CAN_ERR_FLAG set in can_id) bypass the per-motor ID filter set in
+    // Step 7 below and are always delivered. This makes userspace observe the
+    // error skbs that x8h7_can_error_skb (kernel patch 0090 T3) emits on bus-off,
+    // error-passive, and bus-restart events WITHOUT breaking per-motor ID isolation.
+    //
+    // Error mask covers the most operationally relevant classes:
+    //   CAN_ERR_BUSOFF     -- bus entered bus-off state (T3/T4 primary target)
+    //   CAN_ERR_CRTL       -- controller error (TX/RX overflow, error-passive)
+    //   CAN_ERR_TX_TIMEOUT -- TX timed out (congestion indicator)
+    //   CAN_ERR_RESTARTED  -- bus restarted after bus-off (T3 recovery confirmation)
+    //
+    // Failure is non-fatal: error frames will not arrive but the motor connection works.
+    // MotorStateListener guards: if (f.can_id & CAN_ERR_FLAG) { count; continue; }
+    // so an error frame is never decoded as a 0xA0 response (Pitfall 3).
+    {
+        can_err_mask_t err_mask = CAN_ERR_BUSOFF | CAN_ERR_CRTL |
+                                  CAN_ERR_TX_TIMEOUT | CAN_ERR_RESTARTED;
+        if (setsockopt(m_sockfd, SOL_CAN_RAW, CAN_RAW_ERR_FILTER,
+                       &err_mask, sizeof(err_mask)) < 0) {
+            m_logger.warn("SocketCAN: CAN_RAW_ERR_FILTER setsockopt failed: %s ",
+                          strerror(errno));
+            // Non-fatal: continue without error frames.
+        } else {
+            m_logger.info("SocketCAN: CAN_RAW_ERR_FILTER enabled (BUSOFF|CRTL|TX_TIMEOUT|RESTARTED)");
+        }
+    }
+
     // Step 7: Phase 07.1.3 D-11 — apply optional per-socket motor_id filter.
     // When the constructor was given filter_id (approach b2 per-motor sockets),
     // call set_can_id_filter now (post-bind, post-RAW_FD_FRAMES). Failure here
