@@ -316,4 +316,10 @@ TEST_F(SocketCANTest, TimeoutOnNoResponse)
     sc.disconnect();
 }
 
+// ── Phase 07.4.42.2 Wave 0 stubs — bodies land in 07.4.42.2-02 (SDK RX hardening) ──
+TEST_F(SocketCANTest, ErrFrameSkipped)          { GTEST_SKIP() << "WAVE0-STUB: implemented by 07.4.42.2-02 Task 1"; }
+TEST_F(SocketCANTest, ForeignIdDiscarded)       { GTEST_SKIP() << "WAVE0-STUB: implemented by 07.4.42.2-02 Task 1"; }
+TEST_F(SocketCANTest, StaleReplyFlushed)        { GTEST_SKIP() << "WAVE0-STUB: implemented by 07.4.42.2-02 Task 1"; }
+TEST_F(SocketCANTest, NoResponseWriteSendsOnce) { GTEST_SKIP() << "WAVE0-STUB: implemented by 07.4.42.2-02 Task 2"; }
+
 #endif  // WIN32
