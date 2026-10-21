@@ -34,6 +34,7 @@
 
 #ifndef WIN32
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -106,20 +107,53 @@ class SocketCAN final : public I_CommunicationInterface
     ///        See linux/can/raw.h CAN_RAW_FILTER + CAN_SFF_MASK.
     Error_t set_can_id_filter(canId_t motor_id);
 
+    /// @brief Enable/disable local loopback of this socket's TX frames (CAN_RAW_LOOPBACK).
+    ///        Persistent (07.4.42.2-02): stored and re-applied by every connect(), so it
+    ///        survives Candle::init()'s disconnect()+connect(). Applied immediately when
+    ///        already connected. Default false = production behaviour.
+    ///        vcan tests only; production sockets keep loopback off (a vcan frame sent
+    ///        with loopback off reaches no local socket).
+    ///        Returns OK (stored) before connect; INITIALIZATION_ERROR if setsockopt fails.
+    Error_t set_loopback(bool enable);
+
+    /// @brief Turn this socket into a TX-only socket (CAN_RAW_FILTER with zero filters),
+    ///        then drain anything already queued.
+    ///        TX-only socket for the 07.4.42.2 fire-and-forget write lane; survives
+    ///        Candle::init() reconnect (connect() re-applies it and skips the ctor filter_id).
+    ///        Returns OK (stored) before connect; INITIALIZATION_ERROR if setsockopt fails.
+    Error_t disable_rx();
+
+    /// @brief Bound the POLLOUT wait taken once on ENOBUFS before the single TX retry.
+    ///        Clamped to >= 0; default 100 ms (current behaviour). 0 = no wait: the frame
+    ///        is dropped immediately (TRANSMITTER_ERROR) and counted, for the no-wait lane.
+    void set_enobufs_wait_ms(int ms);
+
+    /// @brief Raw socket fd (-1 when not connected). Tests/diagnostics only; do not close.
+    int native_handle() const noexcept { return m_sockfd; }
+
   private:
     /// @brief Parse the USB-dongle envelope (cmd=4) and write canfd_frame to socket.
     ///        Returns OK on success, TRANSMITTER_ERROR on failure (with 1 ENOBUFS retry).
     Error_t send_can_frame(const std::vector<u8> & data);
 
-    /// @brief Receive a canfd_frame from the socket with timeout.
+    /// @brief Receive the reply frame from the socket with timeout.
+    ///        Loops until the deadline: CAN error frames (CAN_ERR_FLAG) are skipped and,
+    ///        when @p expectedId is set, frames whose 11-bit id differs are discarded.
     ///        Packs into {0x00, 0x01, data[0..len-1], zeros...padded}.
-    ///        Returns TIMEOUT on EAGAIN/EWOULDBLOCK; RECEIVER_ERROR on other error.
+    ///        Returns TIMEOUT if no matching frame arrives; RECEIVER_ERROR on socket error.
     std::pair<std::vector<u8>, Error_t> recv_can_frame(
-        u32 timeoutMs, size_t expectedSize);
+        u32 timeoutMs, size_t expectedSize, std::optional<uint32_t> expectedId);
+
+    /// @brief Drain every frame already queued on the socket (non-blocking).
+    ///        Returns the number of frames discarded.
+    size_t flush_stale_rx();
 
     std::string             m_ifname;
     int                     m_sockfd{-1};
     std::optional<canId_t>  m_filter_id;  ///< Phase 07.1.3 D-11: optional per-socket motor_id filter applied in connect()
+    bool                    m_loopback{false};      ///< 07.4.42.2-02: CAN_RAW_LOOPBACK applied by connect()
+    bool                    m_rx_disabled{false};   ///< 07.4.42.2-02: TX-only socket (zero CAN_RAW_FILTER)
+    int                     m_enobufs_wait_ms{100}; ///< 07.4.42.2-02: POLLOUT wait before the ENOBUFS retry
 
     Logger m_logger = Logger(Logger::ProgramLayer_E::BOTTOM, "SocketCAN");
 
@@ -150,6 +184,17 @@ class SocketCAN final : public I_CommunicationInterface
 };
 
 }  // namespace mab
+
+// 07.4.42.2-02 reply-validation / TX-drop counters (relaxed atomics in SocketCAN.cpp).
+// phase_7_4_42_2_reset_rx_counters() zeroes the three RX counters (not tx_enobufs_dropped).
+extern "C"
+{
+    uint64_t phase_7_4_42_2_get_err_frames_skipped(void);
+    uint64_t phase_7_4_42_2_get_foreign_frames_discarded(void);
+    uint64_t phase_7_4_42_2_get_stale_frames_flushed(void);
+    uint64_t phase_7_4_42_2_get_tx_enobufs_dropped(void);
+    void     phase_7_4_42_2_reset_rx_counters(void);
+}
 
 #else  // WIN32
 
@@ -184,6 +229,10 @@ class SocketCAN final : public I_CommunicationInterface
         return {std::vector<u8>(), Error_t::INITIALIZATION_ERROR};
     }
     Error_t set_can_id_filter(canId_t /*motor_id*/) { return Error_t::INITIALIZATION_ERROR; }
+    Error_t set_loopback(bool /*enable*/) { return Error_t::INITIALIZATION_ERROR; }
+    Error_t disable_rx() { return Error_t::INITIALIZATION_ERROR; }
+    void    set_enobufs_wait_ms(int /*ms*/) {}
+    int     native_handle() const noexcept { return -1; }
 
   private:
     Logger m_logger = Logger(Logger::ProgramLayer_E::BOTTOM, "SocketCAN");

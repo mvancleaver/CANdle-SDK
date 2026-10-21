@@ -41,6 +41,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 #include <linux/can.h>
 #include <linux/can/error.h>
@@ -122,6 +124,54 @@ extern "C" void phase_7_4_28_reset_counters(void)
 {
     g_phase_7_4_28_recv_attempts.store(0, std::memory_order_relaxed);
     g_phase_7_4_28_eagain_count.store(0, std::memory_order_relaxed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 07.4.42.2-02 reply-validation + TX-drop counters (RESEARCH P0-2/P0-3/P1-10)
+// ─────────────────────────────────────────────────────────────────────────────
+//   err_frames_skipped     — CAN_ERR_FLAG frames seen by recv_can_frame and skipped
+//   foreign_discarded      — frames whose 11-bit id != the request's target id
+//   stale_flushed          — frames drained by flush_stale_rx() before a request
+//   tx_enobufs_dropped     — frames dropped on ENOBUFS in the no-wait lane
+// Same relaxed-atomic discipline as the Phase 7.4.28/7.4.29 counters above.
+static std::atomic<std::uint64_t> g_phase_7_4_42_2_err_frames_skipped{0};
+static std::atomic<std::uint64_t> g_phase_7_4_42_2_foreign_discarded{0};
+static std::atomic<std::uint64_t> g_phase_7_4_42_2_stale_flushed{0};
+static std::atomic<std::uint64_t> g_phase_7_4_42_2_tx_enobufs_dropped{0};
+
+extern "C" uint64_t phase_7_4_42_2_get_err_frames_skipped(void)
+{
+    return g_phase_7_4_42_2_err_frames_skipped.load(std::memory_order_relaxed);
+}
+extern "C" uint64_t phase_7_4_42_2_get_foreign_frames_discarded(void)
+{
+    return g_phase_7_4_42_2_foreign_discarded.load(std::memory_order_relaxed);
+}
+extern "C" uint64_t phase_7_4_42_2_get_stale_frames_flushed(void)
+{
+    return g_phase_7_4_42_2_stale_flushed.load(std::memory_order_relaxed);
+}
+extern "C" uint64_t phase_7_4_42_2_get_tx_enobufs_dropped(void)
+{
+    return g_phase_7_4_42_2_tx_enobufs_dropped.load(std::memory_order_relaxed);
+}
+extern "C" void phase_7_4_42_2_reset_rx_counters(void)
+{
+    g_phase_7_4_42_2_err_frames_skipped.store(0, std::memory_order_relaxed);
+    g_phase_7_4_42_2_foreign_discarded.store(0, std::memory_order_relaxed);
+    g_phase_7_4_42_2_stale_flushed.store(0, std::memory_order_relaxed);
+}
+
+// Phase 07.4.42.2-02 (RESEARCH P2-4): the per-frame "[SocketCAN-DIAG] TX ..." stderr
+// dump costs ~3000 lines/s at 6 motors x 500 Hz through Docker's json-file logger.
+// Off unless OPHANIM_SOCKETCAN_TX_DIAG starts with '1'; read once per process.
+static bool socketcan_tx_diag_enabled()
+{
+    static const bool enabled = []() {
+        const char * v = std::getenv("OPHANIM_SOCKETCAN_TX_DIAG");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,46 +284,37 @@ I_CommunicationInterface::Error_t SocketCAN::connect()
         return Error_t::INITIALIZATION_ERROR;
     }
 
-    // Step 6: Suppress loopback (we don't want to receive our own TX frames).
-    // CAN_RAW_LOOPBACK is on by default; suppress to avoid confusing recvfrom.
-    int loopback = 0;
+    // Step 6: Local loopback of this socket's TX frames (CAN_RAW_LOOPBACK).
+    // Off by default (production): with loopback on, every TX frame is echoed to every
+    // other local socket on the interface. 07.4.42.2-02: the value is the persistent
+    // m_loopback (set_loopback(); vcan tests only), re-applied on every connect().
+    int loopback = m_loopback ? 1 : 0;
     setsockopt(m_sockfd, SOL_CAN_RAW, CAN_RAW_LOOPBACK, &loopback, sizeof(loopback));
 
-    // Phase 07.4.42.1 T4 -- Enable error-frame delivery (CAN_RAW_ERR_FILTER).
-    // CAN_RAW_ERR_FILTER is INDEPENDENT of CAN_RAW_FILTER: error frames (those
-    // with CAN_ERR_FLAG set in can_id) bypass the per-motor ID filter set in
-    // Step 7 below and are always delivered. This makes userspace observe the
-    // error skbs that x8h7_can_error_skb (kernel patch 0090 T3) emits on bus-off,
-    // error-passive, and bus-restart events WITHOUT breaking per-motor ID isolation.
-    //
-    // Error mask covers the most operationally relevant classes:
-    //   CAN_ERR_BUSOFF     -- bus entered bus-off state (T3/T4 primary target)
-    //   CAN_ERR_CRTL       -- controller error (TX/RX overflow, error-passive)
-    //   CAN_ERR_TX_TIMEOUT -- TX timed out (congestion indicator)
-    //   CAN_ERR_RESTARTED  -- bus restarted after bus-off (T3 recovery confirmation)
-    //
-    // Failure is non-fatal: error frames will not arrive but the motor connection works.
-    // MotorStateListener guards: if (f.can_id & CAN_ERR_FLAG) { count; continue; }
-    // so an error frame is never decoded as a 0xA0 response (Pitfall 3).
-    {
-        can_err_mask_t err_mask = CAN_ERR_BUSOFF | CAN_ERR_CRTL |
-                                  CAN_ERR_TX_TIMEOUT | CAN_ERR_RESTARTED;
-        if (setsockopt(m_sockfd, SOL_CAN_RAW, CAN_RAW_ERR_FILTER,
-                       &err_mask, sizeof(err_mask)) < 0) {
-            m_logger.warn("SocketCAN: CAN_RAW_ERR_FILTER setsockopt failed: %s ",
-                          strerror(errno));
-            // Non-fatal: continue without error frames.
-        } else {
-            m_logger.info("SocketCAN: CAN_RAW_ERR_FILTER enabled (BUSOFF|CRTL|TX_TIMEOUT|RESTARTED)");
-        }
-    }
+    // 07.4.42.2 P0-2: transactional SDK sockets do NOT subscribe to error frames; MotorStateListener owns error-frame delivery.
 
-    // Step 7: Phase 07.1.3 D-11 — apply optional per-socket motor_id filter.
-    // When the constructor was given filter_id (approach b2 per-motor sockets),
-    // call set_can_id_filter now (post-bind, post-RAW_FD_FRAMES). Failure here
-    // is fatal: close the socket and return error so the caller does not get
-    // a half-initialized fd that delivers cross-talk frames.
-    if (m_filter_id.has_value())
+    // Step 7: receive filter.
+    //   - m_rx_disabled (07.4.42.2-02 disable_rx()): zero CAN_RAW_FILTER entries → the
+    //     socket receives nothing (TX-only fire-and-forget lane). Takes precedence over
+    //     the ctor filter_id.
+    //   - Phase 07.1.3 D-11 — apply optional per-socket motor_id filter.
+    //     When the constructor was given filter_id (approach b2 per-motor sockets),
+    //     call set_can_id_filter now (post-bind, post-RAW_FD_FRAMES).
+    // Failure here is fatal: close the socket and return error so the caller does not
+    // get a half-initialized fd that delivers cross-talk frames.
+    if (m_rx_disabled)
+    {
+        if (setsockopt(m_sockfd, SOL_CAN_RAW, CAN_RAW_FILTER, nullptr, 0) < 0)
+        {
+            m_logger.error("SocketCAN: disable_rx (empty CAN_RAW_FILTER) setsockopt failed: %s — closing socket",
+                           strerror(errno));
+            close(m_sockfd);
+            m_sockfd = -1;
+            return Error_t::INITIALIZATION_ERROR;
+        }
+        m_logger.info("SocketCAN: RX disabled (TX-only socket)");
+    }
+    else if (m_filter_id.has_value())
     {
         const Error_t fe = set_can_id_filter(*m_filter_id);
         if (fe != Error_t::OK)
@@ -329,6 +370,85 @@ I_CommunicationInterface::Error_t SocketCAN::set_can_id_filter(canId_t motor_id)
                   static_cast<unsigned>(motor_id),
                   static_cast<unsigned>(CAN_SFF_MASK));
     return Error_t::OK;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Persistent socket options — Phase 07.4.42.2-02
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Candle::init() calls m_bus->disconnect(); m_bus->connect(), so anything set on
+// the fd before attachCandle() would be lost. These setters store the option in a
+// member that connect() re-applies, and apply it immediately when already connected.
+
+I_CommunicationInterface::Error_t SocketCAN::set_loopback(bool enable)
+{
+    m_loopback = enable;
+    if (m_sockfd < 0)
+    {
+        return Error_t::OK;  // applied by connect()
+    }
+    int v = enable ? 1 : 0;
+    if (setsockopt(m_sockfd, SOL_CAN_RAW, CAN_RAW_LOOPBACK, &v, sizeof(v)) < 0)
+    {
+        m_logger.error("SocketCAN: CAN_RAW_LOOPBACK setsockopt failed: %s", strerror(errno));
+        return Error_t::INITIALIZATION_ERROR;
+    }
+    return Error_t::OK;
+}
+
+I_CommunicationInterface::Error_t SocketCAN::disable_rx()
+{
+    m_rx_disabled = true;
+    if (m_sockfd < 0)
+    {
+        return Error_t::OK;  // applied by connect()
+    }
+    if (setsockopt(m_sockfd, SOL_CAN_RAW, CAN_RAW_FILTER, nullptr, 0) < 0)
+    {
+        m_logger.error("SocketCAN: disable_rx (empty CAN_RAW_FILTER) setsockopt failed: %s",
+                       strerror(errno));
+        return Error_t::INITIALIZATION_ERROR;
+    }
+    // Frames queued before the filter change would otherwise sit in the RX buffer forever.
+    flush_stale_rx();
+    return Error_t::OK;
+}
+
+void SocketCAN::set_enobufs_wait_ms(int ms)
+{
+    m_enobufs_wait_ms = std::max(ms, 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// flush_stale_rx() — Phase 07.4.42.2-02 (RESEARCH P0-3 / P1-10)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Non-blocking drain of everything already queued on the socket: late replies of
+// timed-out transactions, other motors' ACKs on an unfiltered socket. Bounded so a
+// flooding bus cannot pin the caller here.
+size_t SocketCAN::flush_stale_rx()
+{
+    if (m_sockfd < 0)
+    {
+        return 0;
+    }
+    constexpr int MAX_FLUSH_FRAMES = 8192;
+    size_t        count            = 0;
+    struct canfd_frame junk{};
+    for (int i = 0; i < MAX_FLUSH_FRAMES; ++i)
+    {
+        const ssize_t n = recvfrom(m_sockfd, &junk, sizeof(junk), MSG_DONTWAIT, nullptr, nullptr);
+        if (n <= 0)
+        {
+            break;
+        }
+        ++count;
+    }
+    if (count > 0)
+    {
+        g_phase_7_4_42_2_stale_flushed.fetch_add(count, std::memory_order_relaxed);
+    }
+    return count;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -412,8 +532,12 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
     //
     // Mirrored across the classic-CAN and CAN-FD branches with the matching
     // struct + size (T-26-01-T2 invariant: wrong-size-on-retry impossible).
+    //
+    // Phase 07.4.42.2-02: the 100 ms POLLOUT window is now the member
+    // m_enobufs_wait_ms (default 100 = unchanged behaviour). 0 selects the
+    // no-wait lane: drop immediately, count in g_phase_7_4_42_2_tx_enobufs_dropped,
+    // log only on power-of-two totals (no per-frame log storm).
     // ─────────────────────────────────────────────────────────────────────────
-    constexpr int ENOBUFS_POLL_TIMEOUT_MS = 100;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Phase 7.4.26 Plan 01 (D-26-01) classic-vs-FD struct + size split.
@@ -443,10 +567,12 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
             std::memcpy(cf.data, data.data() + ENV_PAYLOAD, payload_len);
         }
 
-        // Phase 07.1-03 diagnostic: dump TX frame at ERROR so we can see what's
+        // Phase 07.1-03 diagnostic: dump TX frame to stderr so we can see what's
         // actually being sent (Logger default verbosity filters INFO/DEBUG).
         // Phase 7.4.26 Plan 01 marker: "TX classic can_frame" — load-bearing for
         // structural verification that the classic-vs-FD split is present.
+        // Phase 07.4.42.2-02 (P2-4): gated behind OPHANIM_SOCKETCAN_TX_DIAG=1.
+        if (socketcan_tx_diag_enabled())
         {
             char hex[256];
             size_t off = 0;
@@ -461,27 +587,40 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
         }
 
         ssize_t written = write(m_sockfd, &cf, sizeof(cf));
-        if (written < 0 && errno == ENOBUFS)
+        int     werr    = (written < 0) ? errno : 0;
+        if (written < 0 && werr == ENOBUFS && m_enobufs_wait_ms > 0)
         {
             // Phase 7.4.27 D-27-01 — poll(POLLOUT) replaces fixed 1ms sleep.
             // Bounded TX-queue drain window matching SPI bridge ~95ms RTT.
             struct pollfd pfd = { m_sockfd, POLLOUT, 0 };
-            int pr = ::poll(&pfd, 1, ENOBUFS_POLL_TIMEOUT_MS);
+            int pr = ::poll(&pfd, 1, m_enobufs_wait_ms);
             if (pr > 0 && (pfd.revents & POLLOUT))
             {
                 written = write(m_sockfd, &cf, sizeof(cf));
+                werr    = (written < 0) ? errno : 0;
             }
-            if (written < 0)
+        }
+        if (written < 0)
+        {
+            if (werr == ENOBUFS && m_enobufs_wait_ms == 0)
+            {
+                const auto n = g_phase_7_4_42_2_tx_enobufs_dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((n & (n - 1)) == 0)
+                {
+                    m_logger.error("SocketCAN: TX dropped on ENOBUFS (no-wait lane), total=%llu",
+                                   static_cast<unsigned long long>(n));
+                }
+            }
+            else if (werr == ENOBUFS)
             {
                 m_logger.error(
                     "SocketCAN: classic write() ENOBUFS persisted after %dms poll(POLLOUT): %s",
-                    ENOBUFS_POLL_TIMEOUT_MS, strerror(errno));
-                return Error_t::TRANSMITTER_ERROR;
+                    m_enobufs_wait_ms, strerror(werr));
             }
-        }
-        else if (written < 0)
-        {
-            m_logger.error("SocketCAN: classic write() failed: %s", strerror(errno));
+            else
+            {
+                m_logger.error("SocketCAN: classic write() failed: %s", strerror(werr));
+            }
             return Error_t::TRANSMITTER_ERROR;
         }
 
@@ -510,8 +649,10 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
         // Pad bytes already zero-initialized by `{}` above.
     }
 
-    // Phase 07.1-03 diagnostic: dump TX frame at ERROR so we can see what's
+    // Phase 07.1-03 diagnostic: dump TX frame to stderr so we can see what's
     // actually being sent (Logger default verbosity filters INFO/DEBUG).
+    // Phase 07.4.42.2-02 (P2-4): gated behind OPHANIM_SOCKETCAN_TX_DIAG=1.
+    if (socketcan_tx_diag_enabled())
     {
         char hex[256];
         size_t off = 0;
@@ -531,25 +672,38 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
     // fixed 1ms sleep_for to give the x8h7_can single-slot qdisc a bounded
     // drain window matching the SPI bridge RTT (~95ms).
     ssize_t written = write(m_sockfd, &txf, sizeof(txf));
-    if (written < 0 && errno == ENOBUFS)
+    int     werr    = (written < 0) ? errno : 0;
+    if (written < 0 && werr == ENOBUFS && m_enobufs_wait_ms > 0)
     {
         struct pollfd pfd = { m_sockfd, POLLOUT, 0 };
-        int pr = ::poll(&pfd, 1, ENOBUFS_POLL_TIMEOUT_MS);
+        int pr = ::poll(&pfd, 1, m_enobufs_wait_ms);
         if (pr > 0 && (pfd.revents & POLLOUT))
         {
             written = write(m_sockfd, &txf, sizeof(txf));
+            werr    = (written < 0) ? errno : 0;
         }
-        if (written < 0)
+    }
+    if (written < 0)
+    {
+        if (werr == ENOBUFS && m_enobufs_wait_ms == 0)
+        {
+            const auto n = g_phase_7_4_42_2_tx_enobufs_dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0)
+            {
+                m_logger.error("SocketCAN: TX dropped on ENOBUFS (no-wait lane), total=%llu",
+                               static_cast<unsigned long long>(n));
+            }
+        }
+        else if (werr == ENOBUFS)
         {
             m_logger.error(
                 "SocketCAN: FD write() ENOBUFS persisted after %dms poll(POLLOUT): %s",
-                ENOBUFS_POLL_TIMEOUT_MS, strerror(errno));
-            return Error_t::TRANSMITTER_ERROR;
+                m_enobufs_wait_ms, strerror(werr));
         }
-    }
-    else if (written < 0)
-    {
-        m_logger.error("SocketCAN: FD write() failed: %s", strerror(errno));
+        else
+        {
+            m_logger.error("SocketCAN: FD write() failed: %s", strerror(werr));
+        }
         return Error_t::TRANSMITTER_ERROR;
     }
 
@@ -570,7 +724,7 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
 // ─────────────────────────────────────────────────────────────────────────────
 
 std::pair<std::vector<u8>, I_CommunicationInterface::Error_t>
-SocketCAN::recv_can_frame(u32 timeoutMs, size_t expectedSize)
+SocketCAN::recv_can_frame(u32 timeoutMs, size_t expectedSize, std::optional<uint32_t> expectedId)
 {
     // Phase 7.4.28 instrumentation: count every entry as one recv attempt.
     g_phase_7_4_28_recv_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -600,43 +754,72 @@ SocketCAN::recv_can_frame(u32 timeoutMs, size_t expectedSize)
     constexpr u32 SPI_BRIDGE_MIN_TIMEOUT_MS = 50;
     const u32 effective_timeout = std::max(timeoutMs, SPI_BRIDGE_MIN_TIMEOUT_MS);
 
-    struct pollfd pfd = { m_sockfd, POLLIN, 0 };
-    int pr = ::poll(&pfd, 1, static_cast<int>(effective_timeout));
-    if (pr == 0)
-    {
-        m_logger.error("SocketCAN: poll(POLLIN) timeout after %u ms (caller asked %u ms; floor %u ms)",
-                       effective_timeout, timeoutMs,
-                       static_cast<unsigned>(SPI_BRIDGE_MIN_TIMEOUT_MS));
-        return {result, Error_t::TIMEOUT};
-    }
-    if (pr < 0)
-    {
-        if (errno == EINTR)
-        {
-            m_logger.error("SocketCAN: poll(POLLIN) interrupted (EINTR) — treating as TIMEOUT");
-            return {result, Error_t::TIMEOUT};
-        }
-        m_logger.error("SocketCAN: poll(POLLIN) failed: %s", strerror(errno));
-        return {result, Error_t::RECEIVER_ERROR};
-    }
-
+    // Phase 07.4.42.2-02: loop until a frame that answers THIS request arrives or the
+    // deadline passes (RESEARCH P0-2 / P0-3 / P1-10). Previously the first queued frame
+    // was returned regardless of can_id or CAN_ERR_FLAG, so an error frame or another
+    // motor's (or a stale) 0xA0 ACK could "acknowledge" an enable/disable/mode write.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_timeout);
     struct canfd_frame rxf{};
-    ssize_t n = recvfrom(m_sockfd, &rxf, sizeof(rxf), MSG_DONTWAIT, nullptr, nullptr);
-    if (n < 0)
+    for (;;)
     {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
         {
-            // Phase 7.4.28 instrumentation: count EAGAIN-after-POLLIN-ready races.
-            g_phase_7_4_28_eagain_count.fetch_add(1, std::memory_order_relaxed);
-            // poll(POLLIN) returned ready but recvfrom got EAGAIN — rare race
-            // (frame consumed by another reader on the same socket, or stale
-            // POLLIN). Caller deadline already paid via poll; report TIMEOUT.
-            m_logger.error("SocketCAN: recvfrom(MSG_DONTWAIT) EAGAIN after POLLIN ready (caller asked %u ms)",
-                           timeoutMs);
+            m_logger.error("SocketCAN: no matching reply within %u ms (caller asked %u ms; floor %u ms)",
+                           effective_timeout, timeoutMs,
+                           static_cast<unsigned>(SPI_BRIDGE_MIN_TIMEOUT_MS));
             return {result, Error_t::TIMEOUT};
         }
-        m_logger.error("SocketCAN: recvfrom() failed: %s", strerror(errno));
-        return {result, Error_t::RECEIVER_ERROR};
+        // Round up so a sub-millisecond remainder does not spin on poll(0).
+        const auto remaining_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count() + 1;
+
+        struct pollfd pfd = { m_sockfd, POLLIN, 0 };
+        const int pr = ::poll(&pfd, 1, static_cast<int>(remaining_ms));
+        if (pr == 0)
+        {
+            continue;  // deadline re-checked at the top of the loop
+        }
+        if (pr < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            m_logger.error("SocketCAN: poll(POLLIN) failed: %s", strerror(errno));
+            return {result, Error_t::RECEIVER_ERROR};
+        }
+
+        rxf = canfd_frame{};
+        const ssize_t n = recvfrom(m_sockfd, &rxf, sizeof(rxf), MSG_DONTWAIT, nullptr, nullptr);
+        if (n < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            {
+                // Phase 7.4.28 instrumentation: count EAGAIN-after-POLLIN-ready races
+                // (stale POLLIN or frame consumed by another reader); keep waiting.
+                g_phase_7_4_28_eagain_count.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            m_logger.error("SocketCAN: recvfrom() failed: %s", strerror(errno));
+            return {result, Error_t::RECEIVER_ERROR};
+        }
+        if (n == 0)
+        {
+            continue;
+        }
+        if (rxf.can_id & CAN_ERR_FLAG)
+        {
+            g_phase_7_4_42_2_err_frames_skipped.fetch_add(1, std::memory_order_relaxed);
+            continue;  // P0-2: an error frame is never a motor reply
+        }
+        if (expectedId && ((rxf.can_id & CAN_SFF_MASK) != (*expectedId & CAN_SFF_MASK)))
+        {
+            g_phase_7_4_42_2_foreign_discarded.fetch_add(1, std::memory_order_relaxed);
+            continue;  // P0-3: another motor's frame never satisfies this transaction
+        }
+        break;
     }
 
     // Pack response: {0x00, 0x01, data[0..rxf.len-1], zeros...padded to expectedSize}
@@ -734,6 +917,20 @@ SocketCAN::transfer(std::vector<u8> data, const u32 timeoutMs,
     // ── cmd=4: GENERIC_CAN_FRAME — strip envelope, send raw canfd_frame ──────
     if (cmd == GENERIC_CAN_FRAME)
     {
+        if (data.size() < MIN_ENV_SIZE)
+        {
+            m_logger.error("SocketCAN: transfer: envelope too short (%zu < %zu)",
+                           data.size(), MIN_ENV_SIZE);
+            return {empty_result, Error_t::DATA_EMPTY};
+        }
+        // Reply must come from the motor this request is addressed to (P0-3).
+        const uint32_t target_id = uint32_t(data[ENV_ID_LO]) | (uint32_t(data[ENV_ID_HI]) << 8);
+
+        if (expectedReceivedDataSize > 0)
+        {
+            flush_stale_rx();  // P0-3/P1-10: a late reply must never answer this request
+        }
+
         Error_t send_err = send_can_frame(data);
         if (send_err != Error_t::OK)
         {
@@ -746,8 +943,8 @@ SocketCAN::transfer(std::vector<u8> data, const u32 timeoutMs,
             return {std::vector<u8>(), Error_t::OK};
         }
 
-        // Wait for motor response
-        return recv_can_frame(timeoutMs, expectedReceivedDataSize);
+        // Wait for the matching motor response
+        return recv_can_frame(timeoutMs, expectedReceivedDataSize, target_id);
     }
 
     // ── Unknown cmd byte ─────────────────────────────────────────────────────
