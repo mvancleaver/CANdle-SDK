@@ -70,6 +70,13 @@ namespace mab
             const size_t          responseSize,
             const u32             timeoutMs = DEFAULT_CAN_TIMEOUT) const;
 
+        /// @brief Send one CAN frame without waiting for any response (07.4.42.2 P2-1).
+        ///        SOCKETCAN only: the passive MotorStateListener consumes the 0xA0 ACK.
+        ///        Uses busTransfer(responseLength = 0) → I_CommunicationInterface::transfer(data, timeout).
+        candleTypes::Error_t sendCANFrameNoResponse(const canId_t          canId,
+                                                    const std::vector<u8>& dataToSend,
+                                                    const u32              timeoutMs = DEFAULT_CAN_TIMEOUT) const;
+
         /// @brief Initialize candle
         candleTypes::Error_t init();
 

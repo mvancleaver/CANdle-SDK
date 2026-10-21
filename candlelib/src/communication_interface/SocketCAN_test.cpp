@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -35,6 +36,13 @@
 #include <unistd.h>
 
 #include "SocketCAN.hpp"
+
+#include <candle.hpp>
+#include <MD.hpp>
+
+// Phase 7.4.28 recv-path instrumentation (SocketCAN.cpp): incremented on every
+// recv_can_frame() entry.
+extern "C" unsigned long phase_7_4_28_get_recv_attempts(void);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -498,6 +506,50 @@ TEST_F(SocketCANTest, StaleReplyFlushed)
     sc.disconnect();
 }
 
-TEST_F(SocketCANTest, NoResponseWriteSendsOnce) { GTEST_SKIP() << "WAVE0-STUB: implemented by 07.4.42.2-02 Task 2"; }
+// ── Phase 07.4.42.2-02 Task 2: send-only MD API (RESEARCH P2-1, SDK half) ──────
+//
+// MD::writeMainTargetsNoResponse must put exactly one WRITE_REGISTER_LEGACY frame on
+// the bus and never touch the receive path (the passive MotorStateListener consumes
+// the 0xA0 ACK). Loopback is set BEFORE attachCandle() on purpose: Candle::init()
+// reconnects the bus, so this also proves the option is persistent.
+TEST_F(SocketCANTest, NoResponseWriteSendsOnce)
+{
+    if (!vcan0_available()) {
+        GTEST_SKIP() << "vcan0 not available. Skipping.";
+    }
+
+    int observer = open_sibling_fd();
+    ASSERT_GE(observer, 0);
+
+    auto bus = std::make_unique<mab::SocketCAN>("vcan0");
+    ASSERT_EQ(bus->set_loopback(true), SocketCANErr::OK);
+    mab::Candle * candle = mab::attachCandle(mab::CANdleDatarate_E::CAN_DATARATE_5M, std::move(bus));
+    ASSERT_NE(candle, nullptr) << "attachCandle returned nullptr on vcan0";
+
+    mab::MD md(static_cast<mab::canId_t>(0x137), candle);
+
+    const auto recv_before = phase_7_4_28_get_recv_attempts();
+    const auto t0          = std::chrono::steady_clock::now();
+    const auto err         = md.writeMainTargetsNoResponse(1.0F, 0.5F);
+    const auto elapsed_ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - t0).count();
+    const auto recv_after  = phase_7_4_28_get_recv_attempts();
+
+    EXPECT_EQ(err, mab::MD::Error_t::OK);
+    EXPECT_LT(elapsed_ms, 20) << "a send-only write must not wait for a reply";
+    EXPECT_EQ(recv_after, recv_before) << "a send-only write must never call recv_can_frame";
+
+    canfd_frame f{};
+    ASSERT_TRUE(wait_frame(observer, 100, f)) << "observer saw no frame on vcan0";
+    EXPECT_EQ(f.can_id & CAN_SFF_MASK, 0x137u);
+    EXPECT_EQ(f.data[0], 0x40u) << "WRITE_REGISTER_LEGACY";
+    EXPECT_EQ(f.len, 16u) << "targetPosition + targetTorque = 14-byte payload, FD DLC 16";
+
+    canfd_frame extra{};
+    EXPECT_FALSE(wait_frame(observer, 100, extra)) << "exactly one frame must be sent";
+
+    mab::detachCandle(candle);
+    close(observer);
+}
 
 #endif  // WIN32

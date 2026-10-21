@@ -275,6 +275,29 @@ namespace mab
         return std::pair<std::vector<u8>, candleTypes::Error_t>(response, communicationStatus);
     }
 
+    // Phase 07.4.42.2-02 (RESEARCH P2-1): send-only twin of transferCANFrame. Same
+    // envelope, but busTransfer(responseLength = 0) takes the 2-arg m_bus->transfer path,
+    // so nothing is read back. transferCANFrame/busTransfer are deliberately untouched
+    // (USB path byte-identical).
+    candleTypes::Error_t Candle::sendCANFrameNoResponse(const canId_t          canId,
+                                                        const std::vector<u8>& dataToSend,
+                                                        const u32              timeoutMs) const
+    {
+        if (!m_isInitialized)
+            return candleTypes::Error_t::UNINITIALIZED;
+
+        if (dataToSend.size() > m_maxCANFrameSize)
+        {
+            m_log.error("CAN frame too long!");
+            return candleTypes::Error_t::DATA_TOO_LONG;
+        }
+
+        auto       buffer = std::vector<u8>(dataToSend);
+        const auto hdr    = sendCanFrameHeader(dataToSend.size(), u16(canId), timeoutMs);
+        buffer.insert(buffer.begin(), hdr.begin(), hdr.end());
+        return busTransfer(&buffer, 0, timeoutMs + 1);
+    }
+
     // TODO: this must be changed to something less invasive
     candleTypes::Error_t Candle::legacyCheckConnection()
     {

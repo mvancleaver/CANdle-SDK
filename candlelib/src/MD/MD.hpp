@@ -578,6 +578,71 @@ namespace mab
             }
         }
 
+        /// @brief Fire-and-forget register write (07.4.42.2 P2-1). Same WRITE_REGISTER_LEGACY frame as
+        ///        writeRegisters(), but never waits for / reads the 0xA0 reply. SOCKETCAN only.
+        template <class... T>
+        inline Error_t writeRegistersNoResponse(MDRegisterEntry_S<T>&... regs)
+        {
+            auto tuple = std::tuple<MDRegisterEntry_S<T>&...>(regs...);
+            return writeRegistersNoResponse(tuple);
+        }
+
+        /// @brief Fire-and-forget register write, tuple form (07.4.42.2 P2-1).
+        ///        Delivery is NOT confirmed: the caller must observe the motor's state through
+        ///        the passive listener (age-gated) instead of this return value.
+        /// @return REQUEST_INVALID on any read-only register, NOT_CONNECTED without a Candle,
+        ///         TRANSFER_FAILED if the frame could not be queued, OK once it is queued.
+        template <class... T>
+        inline Error_t writeRegistersNoResponse(std::tuple<MDRegisterEntry_S<T>&...>& regs)
+        {
+            // Same read-only check as writeRegisters().
+            bool        hasReadOnlyRegister = false;
+            std::string readOnlyRegNames;
+            std::apply(
+                [&](auto&&... reg)
+                {
+                    ((hasReadOnlyRegister |=
+                      (reg.m_accessLevel == RegisterAccessLevel_E::RO)
+                          ? (readOnlyRegNames.append(readOnlyRegNames.empty() ? "" : ", ")
+                                 .append(std::string(reg.m_name)),
+                             true)
+                          : false),
+                     ...);
+                },
+                regs);
+
+            if (hasReadOnlyRegister)
+            {
+                std::string errMsg = "Attempt to write to read-only registers: " + readOnlyRegNames;
+                m_log.error(errMsg.c_str());
+                return Error_t::REQUEST_INVALID;
+            }
+
+            if (m_candle == nullptr)
+            {
+                m_log.error("Candle empty!");
+                return Error_t::NOT_CONNECTED;
+            }
+
+            std::vector<u8> frame;
+            frame.push_back((u8)MdFrameId_E::WRITE_REGISTER_LEGACY);
+            frame.push_back((u8)0x0);
+            auto payload = serializeMDRegisters(regs);
+            frame.insert(frame.end(), payload.begin(), payload.end());
+            return m_candle->sendCANFrameNoResponse(m_canId, frame, m_timeout.value_or(10)) ==
+                           candleTypes::Error_t::OK
+                       ? Error_t::OK
+                       : Error_t::TRANSFER_FAILED;
+        }
+
+        /// @brief Fire-and-forget twin of writeMainTargets (legs: targetPosition + targetTorque in one frame).
+        inline Error_t writeMainTargetsNoResponse(float position, float torque)
+        {
+            m_mdRegisters.targetPosition.value = position;
+            m_mdRegisters.targetTorque.value   = torque;
+            return writeRegistersNoResponse(m_mdRegisters.targetPosition, m_mdRegisters.targetTorque);
+        }
+
         /// @brief Write registers to MD memory asynchronously (up to 64 bytes per request)
         /// @tparam ...T Register entry underlying type (should be deducible)
         /// @param ...regs Registry references to be overwritten by data in the MD.
