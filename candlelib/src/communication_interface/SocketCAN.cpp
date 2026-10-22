@@ -174,6 +174,19 @@ static bool socketcan_tx_diag_enabled()
     return enabled;
 }
 
+// Phase 07.4.42.2 bench 2026-10-22 — OPHANIM_SOCKETCAN_CLASSIC_SHORT=1 re-enables the
+// Phase 7.4.26 "classic CAN for payload <= 8" TX branch. Default OFF: every frame is
+// sent as CAN-FD with BRS, which is what the MD80 fleet (fw 2.5.2.r, ids 110/111/120/
+// 121/210/211) actually answers. See the comment block in send_can_frame().
+static bool socketcan_classic_short_enabled()
+{
+    static const bool enabled = []() {
+        const char * v = std::getenv("OPHANIM_SOCKETCAN_CLASSIC_SHORT");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // connect()
 // ─────────────────────────────────────────────────────────────────────────────
@@ -540,11 +553,19 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
     // ─────────────────────────────────────────────────────────────────────────
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Phase 7.4.26 Plan 01 (D-26-01) classic-vs-FD struct + size split.
+    // Phase 7.4.26 Plan 01 (D-26-01) classic-vs-FD struct + size split — NOW OFF BY DEFAULT.
     //
-    // MD80 firmware v2.5.4.r empirically requires CLASSIC CAN framing for
-    // short reads (payload <= 8 bytes) per the 190-frame candletool oracle
-    // capture (runs/phase07.4.25-firstlight/20260519T093955Z-candletool-oracle-capture/).
+    // 7.4.26 concluded from the 190-frame candletool oracle capture that MD80 fw 2.5.4.r
+    // needs CLASSIC CAN framing for short reads (payload <= 8). REFUTED on the bench on
+    // 2026-10-22 (07.4.42.2 HUMAN-UAT item 7): with all six fleet motors powered on can1
+    // (candletool discover -d 5M over USB saw 110/111/120/121/210/211), the same
+    // clearErrors (0x40 reg 0x008A) frame to id 110 sent three ways from the X8 gave
+    //   FD + BRS      -> 0xA0 RESPONSE_LEGACY reply (24 B)
+    //   FD without BRS-> no reply
+    //   classic 2.0   -> no reply (ACKed on the bus, ignored by the motor)
+    // and FD+BRS reads of 0x0802 / 0x0803 / 0x0001 were answered (fw 2.5.2.r, HW 0x04,
+    // canId 0x6e). Every SocketCAN wake-up/init timeout since the deploy came from this
+    // branch. It is kept behind OPHANIM_SOCKETCAN_CLASSIC_SHORT=1 for A/B only.
     //
     // The Linux kernel discriminates classic-vs-FD by write() length (skb->len),
     // NOT by CANFD_FDF flag — verified at include/linux/can/skb.h::can_is_canfd_skb.
@@ -556,9 +577,9 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
     // Phase 7.4.27 Plan 01 (D-27-01) ENOBUFS handling layered in via
     // poll(POLLOUT) helper inside each branch with the matching struct size.
     // ─────────────────────────────────────────────────────────────────────────
-    if (payload_len <= 8)
+    if (payload_len <= 8 && socketcan_classic_short_enabled())
     {
-        // ── CLASSIC CAN branch (TX classic can_frame) ───────────────────────
+        // ── CLASSIC CAN branch (TX classic can_frame) — opt-in A/B only ─────
         struct can_frame cf{};
         cf.can_id = can_id;  // standard 11-bit or 29-bit; kernel handles EFF flag
         cf.can_dlc = payload_len;  // classic CAN DLC is the raw payload byte count
@@ -633,7 +654,7 @@ I_CommunicationInterface::Error_t SocketCAN::send_can_frame(const std::vector<u8
         return Error_t::OK;
     }
 
-    // ── CAN-FD branch (payload > 8: BRS data phase) ─────────────────────────
+    // ── CAN-FD branch (default for ALL payload lengths: BRS data phase) ─────
     const uint8_t dlc_len = pad_to_dlc(payload_len);
 
     struct canfd_frame txf{};
